@@ -27,27 +27,27 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
     }
   };
 
-  const safeRespond = (responseData, statusCode = 200) => {
-    if (responded || res.headersSent) {
-      console.warn('Attempted to send response after headers already sent');
-      return false;
+const safeRespond = (responseData, statusCode = 200) => {
+  if (responded || res.headersSent) {
+    console.warn('Attempted to send response after headers already sent');
+    return false;
+  }
+
+  cleanup();
+
+  try {
+    if (statusCode === 200) {
+      res.json(responseData);
+    } else {
+      res.status(statusCode).json(responseData);
     }
-    
-    responded = true;
-    cleanup();
-    
-    try {
-      if (statusCode === 200) {
-        res.json(responseData);
-      } else {
-        res.status(statusCode).json(responseData);
-      }
-      return true;
-    } catch (err) {
-      console.error('Error sending response:', err.message);
-      return false;
-    }
-  };
+    responded = true; // ← DIPINDAH ke sini, hanya setelah berhasil
+    return true;
+  } catch (err) {
+    console.error('Error sending response:', err.message);
+    return false;
+  }
+};
 
   const safeKill = () => {
     if (!processEnded) {
