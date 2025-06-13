@@ -10,48 +10,103 @@ import { v4 as uuidv4 } from 'uuid';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Helper function untuk handle Python process
-// Helper function SIMPLE VERSION
+// Ultra Simple Helper Function
 const handlePythonProcess = (python, res, tempFilePath = null) => {
   let output = '';
   let finished = false;
+  let timeoutId = null;
 
   const finish = (data, code = 200) => {
-    if (finished) return;
-    finished = true;
-    
-    // Cleanup
-    if (tempFilePath && fs.existsSync(tempFilePath)) {
-      fs.unlinkSync(tempFilePath);
+    if (finished) {
+      console.log('Already finished, skipping...');
+      return;
     }
     
-    // Kill process
-    try { python.kill(); } catch (e) {}
+    finished = true;
+    console.log('Finishing with code:', code);
     
-    // Send response
+    // Clear timeout
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    
+    // Cleanup file
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      try {
+        fs.unlinkSync(tempFilePath);
+        console.log('Cleaned up:', tempFilePath);
+      } catch (e) {
+        console.warn('Cleanup failed:', e.message);
+      }
+    }
+    
+    // Kill process if still running
     try {
-      res.status(code).json(data);
+      if (python && !python.killed) {
+        python.kill('SIGTERM');
+      }
+    } catch (e) {
+      console.warn('Kill failed:', e.message);
+    }
+    
+    // Send response ONLY if not sent
+    try {
+      if (!res.headersSent) {
+        res.status(code).json(data);
+      } else {
+        console.log('Headers already sent, cannot respond');
+      }
     } catch (e) {
       console.error('Response error:', e.message);
     }
   };
 
-  python.stdout.on('data', (data) => output += data.toString());
-  python.stderr.on('data', () => {}); // Ignore all stderr
-  
-  python.on('close', (code) => {
-    if (code === 0 && output.trim()) {
-      try {
-        finish(JSON.parse(output.trim()));
-      } catch (e) {
-        finish({error: 'Parse error'}, 500);
-      }
-    } else {
-      finish({error: 'Process failed'}, 500);
+  // Collect output
+  python.stdout.on('data', (data) => {
+    if (!finished) {
+      output += data.toString();
     }
   });
 
-  setTimeout(() => finish({error: 'Timeout'}, 500), 30000);
+  // Ignore stderr completely - no logging
+  python.stderr.on('data', () => {
+    // Complete silence
+  });
+  
+  // Handle close - ONCE only
+  python.once('close', (code) => {
+    console.log('Python process closed with code:', code);
+    
+    if (finished) {
+      console.log('Already finished, ignoring close event');
+      return;
+    }
+
+    if (code === 0 && output.trim()) {
+      try {
+        const result = JSON.parse(output.trim());
+        finish(result, 200);
+      } catch (e) {
+        console.error('JSON parse error:', e.message);
+        finish({error: 'Failed to parse Python output', details: e.message}, 500);
+      }
+    } else {
+      finish({error: `Python process failed with code ${code}`, output: output.substring(0, 200)}, 500);
+    }
+  });
+
+  // Handle error - ONCE only
+  python.once('error', (err) => {
+    console.error('Python process error:', err.message);
+    finish({error: 'Failed to start Python process', details: err.message}, 500);
+  });
+
+  // Set timeout
+  timeoutId = setTimeout(() => {
+    console.log('Python process timeout');
+    finish({error: 'Python script timeout (30s)'}, 500);
+  }, 30000);
 };
 
 // Tabular prediction
@@ -65,15 +120,23 @@ export const predictTabular = (req, res) => {
     });
   }
 
-  const scriptPath = path.join(__dirname, '..', 'models', 'predict.py');
-  const python = spawn('python', [scriptPath, JSON.stringify(features)], {
-    stdio: ['ignore', 'pipe', 'pipe'] // ignore stdin untuk tabular
-  });
+  try {
+    const scriptPath = path.join(__dirname, '..', 'models', 'predict.py');
+    const python = spawn('python', [scriptPath, JSON.stringify(features)], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
 
-  handlePythonProcess(python, res);
+    handlePythonProcess(python, res);
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to start prediction',
+      details: error.message,
+      status: 'error'
+    });
+  }
 };
 
-// Image prediction - FIXED VERSION
+// Image prediction
 export const predictImage = (req, res) => {
   if (!req.file) {
     return res.status(400).json({
@@ -82,46 +145,50 @@ export const predictImage = (req, res) => {
     });
   }
 
-  // Create temp directory if not exists
-  const tempDir = path.join(__dirname, '..', 'temp');
-  if (!fs.existsSync(tempDir)) {
-    fs.mkdirSync(tempDir, { recursive: true });
-  }
-
-  // Generate unique temp file path
-  const tempFileName = `temp_image_${uuidv4()}.jpg`;
-  const tempFilePath = path.join(tempDir, tempFileName);
+  let tempFilePath = null;
 
   try {
-    // Save uploaded file buffer to temporary file
+    // Create temp directory
+    const tempDir = path.join(__dirname, '..', 'temp');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    // Generate temp file
+    const tempFileName = `temp_image_${uuidv4()}.jpg`;
+    tempFilePath = path.join(tempDir, tempFileName);
+
+    // Save file
     fs.writeFileSync(tempFilePath, req.file.buffer);
     console.log('Saved temp image:', tempFilePath);
 
+    // Start Python process
     const scriptPath = path.join(__dirname, '..', 'models', 'predict.py');
-    
-    // Spawn Python process with file path as argument
     const python = spawn('python', [scriptPath, 'image', tempFilePath], {
-      stdio: ['ignore', 'pipe', 'pipe'], // IMPORTANT: ignore stdin completely
-      shell: process.platform === 'win32', // Enable shell for Windows
-      detached: false // Keep attached to parent process
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32'
     });
 
-    // Handle process with cleanup
     handlePythonProcess(python, res, tempFilePath);
 
   } catch (error) {
-    // Cleanup on error
-    if (fs.existsSync(tempFilePath)) {
+    console.error('Image prediction error:', error.message);
+    
+    // Manual cleanup on error
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
       try {
         fs.unlinkSync(tempFilePath);
       } catch (cleanupErr) {
-        console.warn('Failed to cleanup temp file after error:', cleanupErr.message);
+        console.warn('Manual cleanup failed:', cleanupErr.message);
       }
     }
 
-    res.status(500).json({
-      error: 'Failed to process image: ' + error.message,
-      status: 'error',
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: 'Failed to process image',
+        details: error.message,
+        status: 'error',
+      });
+    }
   }
 };
