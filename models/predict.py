@@ -4,11 +4,11 @@ import numpy as np
 from PIL import Image
 import os
 
-import tflite_runtime.interpreter as tflite
+import tensorflow as tf
 
 # Load model .tflite
 model_path = os.path.join(os.path.dirname(__file__), 'model.tflite')
-interpreter = tflite.Interpreter(model_path=model_path)
+interpreter = tf.lite.Interpreter(model_path=model_path)
 interpreter.allocate_tensors()
 
 # Ambil info input/output
@@ -31,6 +31,13 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) > 2 and sys.argv[1] == "image":
             image_path = sys.argv[2]
+
+            # Validasi file exists
+            if not os.path.exists(image_path):
+                result = {"status": "error", "error": f"Image file not found: {image_path}"}
+                print(json.dumps(result))
+                sys.stdout.flush()  # TAMBAHKAN INI
+                sys.exit(1)
 
             # Info ukuran input model
             height, width = input_details[0]['shape'][1], input_details[0]['shape'][2]
@@ -69,8 +76,19 @@ if __name__ == "__main__":
                 "model_type": "tflite"
             }
             print(json.dumps(result))
+            sys.stdout.flush()  # TAMBAHKAN INI
+            
         else:
-            print(json.dumps({"status": "error", "error": "Invalid arguments"}))
+            result = {"status": "error", "error": "Invalid arguments"}
+            print(json.dumps(result))
+            sys.stdout.flush()  # TAMBAHKAN INI
+            
     except Exception as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
+        result = {"status": "error", "error": str(e)}
+        print(json.dumps(result))
+        sys.stdout.flush()  # TAMBAHKAN INI
         sys.exit(1)
+    
+    # TAMBAHKAN DELAY KECIL SEBELUM EXIT
+    import time
+    time.sleep(0.1)
