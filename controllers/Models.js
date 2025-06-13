@@ -143,15 +143,19 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
   });
 
   // Disable stdin completely to prevent EPIPE
+if (python.stdin) {
   try {
     python.stdin.on('error', (err) => {
-      // Ignore stdin errors since we're not using it
       console.warn('Python stdin error (ignored):', err.message);
     });
     python.stdin.end();
   } catch (err) {
     console.warn('Error handling stdin:', err.message);
   }
+} else {
+  console.log('stdin is null — skipped .on and .end');
+}
+
 
   // Timeout handler
   const timeoutId = setTimeout(() => {
