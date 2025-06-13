@@ -11,183 +11,47 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Helper function untuk handle Python process
+// Helper function SIMPLE VERSION
 const handlePythonProcess = (python, res, tempFilePath = null) => {
   let output = '';
-  let responded = false;
-  let processEnded = false;
+  let finished = false;
 
-  const cleanup = () => {
+  const finish = (data, code = 200) => {
+    if (finished) return;
+    finished = true;
+    
+    // Cleanup
     if (tempFilePath && fs.existsSync(tempFilePath)) {
-      try {
-        fs.unlinkSync(tempFilePath);
-        console.log('Cleaned up temp file:', tempFilePath);
-      } catch (err) {
-        console.warn('Failed to cleanup temp file:', err.message);
-      }
-    }
-  };
-
-  const safeRespond = (responseData, statusCode = 200) => {
-    if (responded || res.headersSent || res.destroyed) {
-      console.warn('Attempted to send response after headers already sent or connection destroyed');
-      cleanup();
-      return false;
+      fs.unlinkSync(tempFilePath);
     }
     
-    responded = true;
-    cleanup();
+    // Kill process
+    try { python.kill(); } catch (e) {}
     
+    // Send response
     try {
-      if (statusCode === 200) {
-        res.json(responseData);
-      } else {
-        res.status(statusCode).json(responseData);
-      }
-      return true;
-    } catch (err) {
-      console.error('Error sending response:', err.message);
-      return false;
+      res.status(code).json(data);
+    } catch (e) {
+      console.error('Response error:', e.message);
     }
   };
 
-  const safeKill = () => {
-    if (!processEnded) {
-      processEnded = true;
-      try {
-        if (python && !python.killed) {
-          python.kill('SIGTERM');
-          // Fallback kill after 2s
-          setTimeout(() => {
-            if (python.exitCode === null && !python.killed) {
-              python.kill('SIGKILL');
-            }
-          }, 2000);
-        }
-      } catch (err) {
-        console.warn('Error killing Python process:', err.message);
-      }
-    }
-  };
-
-  // Handle stdout
-  python.stdout.on('data', (data) => {
-    if (!responded && !res.headersSent) {
-      output += data.toString();
-    }
-  });
-
-  // Handle stderr - skip TensorFlow messages
-  python.stderr.on('data', (data) => {
-    const errMsg = data.toString();
-    
-    // Skip TensorFlow info messages completely
-    const isTensorFlowInfo = 
-      errMsg.includes('INFO:') ||
-      errMsg.includes('Created TensorFlow Lite') ||
-      errMsg.includes('This TensorFlow binary is optimized') ||
-      errMsg.includes('oneDNN') ||
-      errMsg.includes('XNNPACK') ||
-      errMsg.trim() === '';
-
-    if (!isTensorFlowInfo) {
-      console.error('Python stderr:', errMsg);
-    }
-
-    // Only treat as real error if it contains actual error indicators
-    const isRealError =
-      errMsg.includes('Traceback') ||
-      errMsg.includes('Error:') ||
-      errMsg.includes('Exception:') ||
-      errMsg.includes('ModuleNotFoundError') ||
-      errMsg.includes('FileNotFoundError');
-
-    if (!responded && isRealError && !isTensorFlowInfo) {
-      safeKill();
-      safeRespond({
-        error: 'Model prediction failed: ' + errMsg,
-        status: 'error',
-      }, 500);
-    }
-  });
-
-  // Handle process close
+  python.stdout.on('data', (data) => output += data.toString());
+  python.stderr.on('data', () => {}); // Ignore all stderr
+  
   python.on('close', (code) => {
-    processEnded = true;
-    
-    // Immediate check to prevent race condition
-    if (responded || res.headersSent || res.destroyed) {
-      return;
-    }
-
-    try {
-      if (code === 0 && output.trim()) {
-        const result = JSON.parse(output.trim());
-        safeRespond(result);
-      } else if (code !== 0) {
-        safeRespond({
-          error: `Python process exited with code ${code}`,
-          status: 'error',
-          output: output.substring(0, 500) // Limit output length
-        }, 500);
-      } else {
-        safeRespond({
-          error: 'No output from Python process',
-          status: 'error'
-        }, 500);
+    if (code === 0 && output.trim()) {
+      try {
+        finish(JSON.parse(output.trim()));
+      } catch (e) {
+        finish({error: 'Parse error'}, 500);
       }
-    } catch (err) {
-      safeRespond({
-        error: 'Failed to parse output: ' + err.message,
-        status: 'error',
-        raw_output: output.substring(0, 500)
-      }, 500);
+    } else {
+      finish({error: 'Process failed'}, 500);
     }
   });
 
-  // Handle process error
-  python.on('error', (err) => {
-    processEnded = true;
-    console.error('Python process error:', err.message);
-    
-    if (!responded && !res.headersSent && !res.destroyed) {
-      safeRespond({
-        error: 'Failed to start Python process: ' + err.message,
-        status: 'error',
-      }, 500);
-    }
-  });
-
-  // Handle request close/abort
-  res.on('close', () => {
-    if (!responded) {
-      responded = true;
-      safeKill();
-      cleanup();
-    }
-  });
-
-  // DON'T handle stdin since we use 'ignore'
-  // python.stdin is null when stdio[0] = 'ignore'
-
-  // Timeout handler
-  const timeoutId = setTimeout(() => {
-    if (!responded && !res.headersSent && !res.destroyed) {
-      safeKill();
-      safeRespond({
-        error: 'Python script timeout (30s)',
-        status: 'error',
-      }, 500);
-    }
-  }, 30000);
-
-  // Clear timeout when process ends
-  python.on('close', () => {
-    clearTimeout(timeoutId);
-  });
-
-  python.on('error', () => {
-    clearTimeout(timeoutId);
-  });
+  setTimeout(() => finish({error: 'Timeout'}, 500), 30000);
 };
 
 // Tabular prediction
