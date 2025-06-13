@@ -27,61 +27,67 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
     }
   };
 
-const safeRespond = (responseData, statusCode = 200) => {
-  if (responded || res.headersSent) {
-    console.warn('Attempted to send response after headers already sent');
-    return false;
-  }
-
-  cleanup();
-
-  try {
-    if (statusCode === 200) {
-      res.json(responseData);
-    } else {
-      res.status(statusCode).json(responseData);
+  const safeRespond = (responseData, statusCode = 200) => {
+    if (responded || res.headersSent || res.destroyed) {
+      console.warn('Attempted to send response after headers already sent or connection destroyed');
+      cleanup();
+      return false;
     }
-    responded = true; // ← DIPINDAH ke sini, hanya setelah berhasil
-    return true;
-  } catch (err) {
-    console.error('Error sending response:', err.message);
-    return false;
-  }
-};
+    
+    responded = true;
+    cleanup();
+    
+    try {
+      if (statusCode === 200) {
+        res.json(responseData);
+      } else {
+        res.status(statusCode).json(responseData);
+      }
+      return true;
+    } catch (err) {
+      console.error('Error sending response:', err.message);
+      return false;
+    }
+  };
 
   const safeKill = () => {
     if (!processEnded) {
       processEnded = true;
       try {
-        python.kill('SIGTERM');
-        // Fallback kill after 2s
-        setTimeout(() => {
-          if (python.exitCode === null) {
-            python.kill('SIGKILL');
-          }
-        }, 2000);
+        if (python && !python.killed) {
+          python.kill('SIGTERM');
+          // Fallback kill after 2s
+          setTimeout(() => {
+            if (python.exitCode === null && !python.killed) {
+              python.kill('SIGKILL');
+            }
+          }, 2000);
+        }
       } catch (err) {
         console.warn('Error killing Python process:', err.message);
       }
     }
   };
 
+  // Handle stdout
   python.stdout.on('data', (data) => {
-    if (!responded) {
+    if (!responded && !res.headersSent) {
       output += data.toString();
     }
   });
 
+  // Handle stderr - skip TensorFlow messages
   python.stderr.on('data', (data) => {
     const errMsg = data.toString();
     
-    // Skip TensorFlow info messages completely - don't even log them
+    // Skip TensorFlow info messages completely
     const isTensorFlowInfo = 
       errMsg.includes('INFO:') ||
       errMsg.includes('Created TensorFlow Lite') ||
       errMsg.includes('This TensorFlow binary is optimized') ||
       errMsg.includes('oneDNN') ||
-      errMsg.includes('XNNPACK');
+      errMsg.includes('XNNPACK') ||
+      errMsg.trim() === '';
 
     if (!isTensorFlowInfo) {
       console.error('Python stderr:', errMsg);
@@ -104,39 +110,46 @@ const safeRespond = (responseData, statusCode = 200) => {
     }
   });
 
-python.on('close', (code) => {
-  processEnded = true;
-  clearTimeout(timeoutId); // ← tambahkan ini di awal
-
-  if (responded || res.headersSent) {
-    return; // Already responded
-  }
-
-  try {
-    if (code === 0 && output.trim()) {
-      const result = JSON.parse(output.trim());
-      return safeRespond(result);
-    } else {
-      return safeRespond({
-        error: `Python process exited with code ${code}`,
-        status: 'error',
-        output: output
-      }, 500);
-    }
-  } catch (err) {
-    return safeRespond({
-      error: 'Failed to parse output: ' + err.message,
-      status: 'error',
-      raw_output: output
-    }, 500);
-  }
-});
-
-
-  python.on('error', (err) => {
+  // Handle process close
+  python.on('close', (code) => {
     processEnded = true;
     
-    if (!responded && !res.headersSent) {
+    // Immediate check to prevent race condition
+    if (responded || res.headersSent || res.destroyed) {
+      return;
+    }
+
+    try {
+      if (code === 0 && output.trim()) {
+        const result = JSON.parse(output.trim());
+        safeRespond(result);
+      } else if (code !== 0) {
+        safeRespond({
+          error: `Python process exited with code ${code}`,
+          status: 'error',
+          output: output.substring(0, 500) // Limit output length
+        }, 500);
+      } else {
+        safeRespond({
+          error: 'No output from Python process',
+          status: 'error'
+        }, 500);
+      }
+    } catch (err) {
+      safeRespond({
+        error: 'Failed to parse output: ' + err.message,
+        status: 'error',
+        raw_output: output.substring(0, 500)
+      }, 500);
+    }
+  });
+
+  // Handle process error
+  python.on('error', (err) => {
+    processEnded = true;
+    console.error('Python process error:', err.message);
+    
+    if (!responded && !res.headersSent && !res.destroyed) {
       safeRespond({
         error: 'Failed to start Python process: ' + err.message,
         status: 'error',
@@ -144,24 +157,21 @@ python.on('close', (code) => {
     }
   });
 
-  // Disable stdin completely to prevent EPIPE
-if (python.stdin) {
-  try {
-    python.stdin.on('error', (err) => {
-      console.warn('Python stdin error (ignored):', err.message);
-    });
-    python.stdin.end();
-  } catch (err) {
-    console.warn('Error handling stdin:', err.message);
-  }
-} else {
-  console.log('stdin is null — skipped .on and .end');
-}
+  // Handle request close/abort
+  res.on('close', () => {
+    if (!responded) {
+      responded = true;
+      safeKill();
+      cleanup();
+    }
+  });
 
+  // DON'T handle stdin since we use 'ignore'
+  // python.stdin is null when stdio[0] = 'ignore'
 
   // Timeout handler
   const timeoutId = setTimeout(() => {
-    if (!responded && !res.headersSent) {
+    if (!responded && !res.headersSent && !res.destroyed) {
       safeKill();
       safeRespond({
         error: 'Python script timeout (30s)',
@@ -170,7 +180,14 @@ if (python.stdin) {
     }
   }, 30000);
 
-  // Clear timeout if process ends normally
+  // Clear timeout when process ends
+  python.on('close', () => {
+    clearTimeout(timeoutId);
+  });
+
+  python.on('error', () => {
+    clearTimeout(timeoutId);
+  });
 };
 
 // Tabular prediction
