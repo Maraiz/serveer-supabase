@@ -27,6 +27,28 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
     }
   };
 
+  const safeRespond = (responseData, statusCode = 200) => {
+    if (responded || res.headersSent) {
+      console.warn('Attempted to send response after headers already sent');
+      return false;
+    }
+    
+    responded = true;
+    cleanup();
+    
+    try {
+      if (statusCode === 200) {
+        res.json(responseData);
+      } else {
+        res.status(statusCode).json(responseData);
+      }
+      return true;
+    } catch (err) {
+      console.error('Error sending response:', err.message);
+      return false;
+    }
+  };
+
   const safeKill = () => {
     if (!processEnded) {
       processEnded = true;
@@ -45,7 +67,9 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
   };
 
   python.stdout.on('data', (data) => {
-    output += data.toString();
+    if (!responded) {
+      output += data.toString();
+    }
   });
 
   python.stderr.on('data', (data) => {
@@ -72,83 +96,78 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
       errMsg.includes('FileNotFoundError');
 
     if (!responded && isRealError && !isTensorFlowInfo) {
-      responded = true;
       safeKill();
-      cleanup();
-      res.status(500).json({
+      safeRespond({
         error: 'Model prediction failed: ' + errMsg,
         status: 'error',
-      });
+      }, 500);
     }
   });
 
   python.on('close', (code) => {
     processEnded = true;
-    if (responded) return;
+    
+    if (responded || res.headersSent) {
+      return; // Already responded
+    }
 
     try {
       if (code === 0 && output.trim()) {
         const result = JSON.parse(output.trim());
-        responded = true;
-        cleanup();
-        res.json(result);
+        safeRespond(result);
       } else {
-        responded = true;
-        cleanup();
-        res.status(500).json({
+        safeRespond({
           error: `Python process exited with code ${code}`,
           status: 'error',
           output: output
-        });
+        }, 500);
       }
     } catch (err) {
-      responded = true;
-      cleanup();
-      res.status(500).json({
+      safeRespond({
         error: 'Failed to parse output: ' + err.message,
         status: 'error',
         raw_output: output
-      });
+      }, 500);
     }
   });
 
   python.on('error', (err) => {
     processEnded = true;
-    if (!responded) {
-      responded = true;
-      cleanup();
-      res.status(500).json({
+    
+    if (!responded && !res.headersSent) {
+      safeRespond({
         error: 'Failed to start Python process: ' + err.message,
         status: 'error',
-      });
+      }, 500);
     }
   });
 
   // Disable stdin completely to prevent EPIPE
-  python.stdin.on('error', (err) => {
-    // Ignore stdin errors since we're not using it
-    console.warn('Python stdin error (ignored):', err.message);
-  });
-
-  // Close stdin immediately
   try {
+    python.stdin.on('error', (err) => {
+      // Ignore stdin errors since we're not using it
+      console.warn('Python stdin error (ignored):', err.message);
+    });
     python.stdin.end();
   } catch (err) {
-    console.warn('Error closing stdin:', err.message);
+    console.warn('Error handling stdin:', err.message);
   }
 
   // Timeout handler
-  setTimeout(() => {
-    if (!responded) {
-      responded = true;
+  const timeoutId = setTimeout(() => {
+    if (!responded && !res.headersSent) {
       safeKill();
-      cleanup();
-      res.status(500).json({
+      safeRespond({
         error: 'Python script timeout (30s)',
         status: 'error',
-      });
+      }, 500);
     }
   }, 30000);
+
+  // Clear timeout if process ends normally
+  python.on('close', () => {
+    clearTimeout(timeoutId);
+  });
 };
 
 // Tabular prediction
