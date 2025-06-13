@@ -14,6 +14,7 @@ const __dirname = path.dirname(__filename);
 const handlePythonProcess = (python, res, tempFilePath = null) => {
   let output = '';
   let responded = false;
+  let processEnded = false;
 
   const cleanup = () => {
     if (tempFilePath && fs.existsSync(tempFilePath)) {
@@ -26,13 +27,41 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
     }
   };
 
+  const safeKill = () => {
+    if (!processEnded) {
+      processEnded = true;
+      try {
+        python.kill('SIGTERM');
+        // Fallback kill after 2s
+        setTimeout(() => {
+          if (python.exitCode === null) {
+            python.kill('SIGKILL');
+          }
+        }, 2000);
+      } catch (err) {
+        console.warn('Error killing Python process:', err.message);
+      }
+    }
+  };
+
   python.stdout.on('data', (data) => {
     output += data.toString();
   });
 
   python.stderr.on('data', (data) => {
     const errMsg = data.toString();
-    console.error('Python stderr:', errMsg);
+    
+    // Skip TensorFlow info messages completely - don't even log them
+    const isTensorFlowInfo = 
+      errMsg.includes('INFO:') ||
+      errMsg.includes('Created TensorFlow Lite') ||
+      errMsg.includes('This TensorFlow binary is optimized') ||
+      errMsg.includes('oneDNN') ||
+      errMsg.includes('XNNPACK');
+
+    if (!isTensorFlowInfo) {
+      console.error('Python stderr:', errMsg);
+    }
 
     // Only treat as real error if it contains actual error indicators
     const isRealError =
@@ -42,15 +71,9 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
       errMsg.includes('ModuleNotFoundError') ||
       errMsg.includes('FileNotFoundError');
 
-    // Skip TensorFlow info messages
-    const isTensorFlowInfo = 
-      errMsg.includes('INFO:') ||
-      errMsg.includes('Created TensorFlow Lite') ||
-      errMsg.includes('This TensorFlow binary is optimized') ||
-      errMsg.includes('oneDNN');
-
     if (!responded && isRealError && !isTensorFlowInfo) {
       responded = true;
+      safeKill();
       cleanup();
       res.status(500).json({
         error: 'Model prediction failed: ' + errMsg,
@@ -60,6 +83,7 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
   });
 
   python.on('close', (code) => {
+    processEnded = true;
     if (responded) return;
 
     try {
@@ -89,6 +113,7 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
   });
 
   python.on('error', (err) => {
+    processEnded = true;
     if (!responded) {
       responded = true;
       cleanup();
@@ -99,11 +124,24 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
     }
   });
 
+  // Disable stdin completely to prevent EPIPE
+  python.stdin.on('error', (err) => {
+    // Ignore stdin errors since we're not using it
+    console.warn('Python stdin error (ignored):', err.message);
+  });
+
+  // Close stdin immediately
+  try {
+    python.stdin.end();
+  } catch (err) {
+    console.warn('Error closing stdin:', err.message);
+  }
+
   // Timeout handler
   setTimeout(() => {
     if (!responded) {
       responded = true;
-      python.kill('SIGTERM');
+      safeKill();
       cleanup();
       res.status(500).json({
         error: 'Python script timeout (30s)',
@@ -160,8 +198,9 @@ export const predictImage = (req, res) => {
     
     // Spawn Python process with file path as argument
     const python = spawn('python', [scriptPath, 'image', tempFilePath], {
-      stdio: ['ignore', 'pipe', 'pipe'], // IMPORTANT: ignore stdin
-      shell: process.platform === 'win32' // Enable shell for Windows
+      stdio: ['ignore', 'pipe', 'pipe'], // IMPORTANT: ignore stdin completely
+      shell: process.platform === 'win32', // Enable shell for Windows
+      detached: false // Keep attached to parent process
     });
 
     // Handle process with cleanup
