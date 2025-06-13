@@ -104,32 +104,34 @@ const handlePythonProcess = (python, res, tempFilePath = null) => {
     }
   });
 
-  python.on('close', (code) => {
-    processEnded = true;
-    
-    if (responded || res.headersSent) {
-      return; // Already responded
-    }
+python.on('close', (code) => {
+  processEnded = true;
+  clearTimeout(timeoutId); // ← tambahkan ini di awal
 
-    try {
-      if (code === 0 && output.trim()) {
-        const result = JSON.parse(output.trim());
-        safeRespond(result);
-      } else {
-        safeRespond({
-          error: `Python process exited with code ${code}`,
-          status: 'error',
-          output: output
-        }, 500);
-      }
-    } catch (err) {
-      safeRespond({
-        error: 'Failed to parse output: ' + err.message,
+  if (responded || res.headersSent) {
+    return; // Already responded
+  }
+
+  try {
+    if (code === 0 && output.trim()) {
+      const result = JSON.parse(output.trim());
+      return safeRespond(result);
+    } else {
+      return safeRespond({
+        error: `Python process exited with code ${code}`,
         status: 'error',
-        raw_output: output
+        output: output
       }, 500);
     }
-  });
+  } catch (err) {
+    return safeRespond({
+      error: 'Failed to parse output: ' + err.message,
+      status: 'error',
+      raw_output: output
+    }, 500);
+  }
+});
+
 
   python.on('error', (err) => {
     processEnded = true;
@@ -169,9 +171,6 @@ if (python.stdin) {
   }, 30000);
 
   // Clear timeout if process ends normally
-  python.on('close', () => {
-    clearTimeout(timeoutId);
-  });
 };
 
 // Tabular prediction
