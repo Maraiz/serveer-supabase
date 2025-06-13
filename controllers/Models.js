@@ -1,18 +1,30 @@
 import { spawn } from 'child_process';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import sharp from 'sharp';
 import supabase from '../lib/supabase.js';
-import { v4 as uuidv4 } from 'uuid'; // untuk nama file unik
+import { v4 as uuidv4 } from 'uuid';
 
 // Untuk ES module (__dirname)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Helper function untuk handle Python process
-const handlePythonProcess = (python, res) => {
+const handlePythonProcess = (python, res, tempFilePath = null) => {
   let output = '';
   let responded = false;
+
+  const cleanup = () => {
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      try {
+        fs.unlinkSync(tempFilePath);
+        console.log('Cleaned up temp file:', tempFilePath);
+      } catch (err) {
+        console.warn('Failed to cleanup temp file:', err.message);
+      }
+    }
+  };
 
   python.stdout.on('data', (data) => {
     output += data.toString();
@@ -22,13 +34,24 @@ const handlePythonProcess = (python, res) => {
     const errMsg = data.toString();
     console.error('Python stderr:', errMsg);
 
+    // Only treat as real error if it contains actual error indicators
     const isRealError =
       errMsg.includes('Traceback') ||
-      errMsg.toLowerCase().includes('error') ||
-      errMsg.toLowerCase().includes('exception');
+      errMsg.includes('Error:') ||
+      errMsg.includes('Exception:') ||
+      errMsg.includes('ModuleNotFoundError') ||
+      errMsg.includes('FileNotFoundError');
 
-    if (!responded && isRealError) {
+    // Skip TensorFlow info messages
+    const isTensorFlowInfo = 
+      errMsg.includes('INFO:') ||
+      errMsg.includes('Created TensorFlow Lite') ||
+      errMsg.includes('This TensorFlow binary is optimized') ||
+      errMsg.includes('oneDNN');
+
+    if (!responded && isRealError && !isTensorFlowInfo) {
       responded = true;
+      cleanup();
       res.status(500).json({
         error: 'Model prediction failed: ' + errMsg,
         status: 'error',
@@ -36,17 +59,41 @@ const handlePythonProcess = (python, res) => {
     }
   });
 
-  python.on('close', () => {
+  python.on('close', (code) => {
     if (responded) return;
 
     try {
-      const result = JSON.parse(output);
-      responded = true;
-      res.json(result);
+      if (code === 0 && output.trim()) {
+        const result = JSON.parse(output.trim());
+        responded = true;
+        cleanup();
+        res.json(result);
+      } else {
+        responded = true;
+        cleanup();
+        res.status(500).json({
+          error: `Python process exited with code ${code}`,
+          status: 'error',
+          output: output
+        });
+      }
     } catch (err) {
       responded = true;
+      cleanup();
       res.status(500).json({
         error: 'Failed to parse output: ' + err.message,
+        status: 'error',
+        raw_output: output
+      });
+    }
+  });
+
+  python.on('error', (err) => {
+    if (!responded) {
+      responded = true;
+      cleanup();
+      res.status(500).json({
+        error: 'Failed to start Python process: ' + err.message,
         status: 'error',
       });
     }
@@ -56,9 +103,10 @@ const handlePythonProcess = (python, res) => {
   setTimeout(() => {
     if (!responded) {
       responded = true;
-      python.kill();
+      python.kill('SIGTERM');
+      cleanup();
       res.status(500).json({
-        error: 'Python script timeout',
+        error: 'Python script timeout (30s)',
         status: 'error',
       });
     }
@@ -77,12 +125,14 @@ export const predictTabular = (req, res) => {
   }
 
   const scriptPath = path.join(__dirname, '..', 'models', 'predict.py');
-  const python = spawn('python', [scriptPath, JSON.stringify(features)]);
+  const python = spawn('python', [scriptPath, JSON.stringify(features)], {
+    stdio: ['ignore', 'pipe', 'pipe'] // ignore stdin untuk tabular
+  });
 
   handlePythonProcess(python, res);
 };
 
-// Image prediction
+// Image prediction - FIXED VERSION
 export const predictImage = (req, res) => {
   if (!req.file) {
     return res.status(400).json({
@@ -91,15 +141,45 @@ export const predictImage = (req, res) => {
     });
   }
 
-  const scriptPath = path.join(__dirname, '..', 'models', 'predict.py');
+  // Create temp directory if not exists
+  const tempDir = path.join(__dirname, '..', 'temp');
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
 
-  const python = spawn('python', [scriptPath, 'image'], {
-    stdio: ['pipe', 'pipe', 'pipe'] // untuk kirim buffer lewat stdin
-  });
+  // Generate unique temp file path
+  const tempFileName = `temp_image_${uuidv4()}.jpg`;
+  const tempFilePath = path.join(tempDir, tempFileName);
 
-  // Kirim image buffer ke Python stdin
-  python.stdin.write(req.file.buffer);
-  python.stdin.end();
+  try {
+    // Save uploaded file buffer to temporary file
+    fs.writeFileSync(tempFilePath, req.file.buffer);
+    console.log('Saved temp image:', tempFilePath);
 
-  handlePythonProcess(python, res);
+    const scriptPath = path.join(__dirname, '..', 'models', 'predict.py');
+    
+    // Spawn Python process with file path as argument
+    const python = spawn('python', [scriptPath, 'image', tempFilePath], {
+      stdio: ['ignore', 'pipe', 'pipe'], // IMPORTANT: ignore stdin
+      shell: process.platform === 'win32' // Enable shell for Windows
+    });
+
+    // Handle process with cleanup
+    handlePythonProcess(python, res, tempFilePath);
+
+  } catch (error) {
+    // Cleanup on error
+    if (fs.existsSync(tempFilePath)) {
+      try {
+        fs.unlinkSync(tempFilePath);
+      } catch (cleanupErr) {
+        console.warn('Failed to cleanup temp file after error:', cleanupErr.message);
+      }
+    }
+
+    res.status(500).json({
+      error: 'Failed to process image: ' + error.message,
+      status: 'error',
+    });
+  }
 };
