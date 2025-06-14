@@ -36,6 +36,10 @@ Content-Type: application/json
     "password": "123456789"
 }
 
+### 2. Get All Workout Sessions (Tanpa Filter)
+GET {{baseUrl}}/workout-sessions
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI4MWQzY2UzOS1jOTg3LTQzZTUtYmM0Yy0yMDhmOTM4NTNlZTUiLCJuYW1lIjoiTWF1bGFuYSBBa2JhciIsImVtYWlsIjoibWF1bGFuYTEyM0BnbWFpbC5jb20iLCJpYXQiOjE3NDk5MDM0OTMsImV4cCI6MTc0OTkwNDM5M30.d8LhGW6HdDelrtSzXhho2KbRavuPX7NN7fCQcT2ejPM
+
 ### 3. Get Users (Protected)
 GET {{baseUrl}}/users
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjIsIm5hbWUiOiJNYXVsYW5hIEFrYmFyIiwiZW1haWwiOiJtYXVsYW5hMTIzQGdtYWlsLmNvbSIsImlhdCI6MTc0OTQ5NTc2MCwiZXhwIjoxNzQ5NDk2NjYwfQ.PP8Kr9Io7KOqvgFAV0GxN3__kcNKCDKrfz_YZkasuN4
