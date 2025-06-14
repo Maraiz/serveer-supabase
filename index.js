@@ -40,10 +40,20 @@ async function connectDatabase() {
 }
 
 // Middlewares
+const allowedOrigins = process.env.FRONTEND_URL?.split(',') || [];
+
 app.use(cors({
   credentials: true,
-  origin: process.env.FRONTEND_URL || 'http://localhost:9000'
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`❌ CORS blocked request from origin: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  }
 }));
+
 
 app.use(cookieParser());
 
