@@ -42,8 +42,7 @@ async function connectDatabase() {
 // Middlewares
 app.use(cors({
   credentials: true,
-  // origin: process.env.FRONTEND_URL || 'http://localhost:9000'
-  origin: '*'
+  origin: process.env.FRONTEND_URL || 'http://localhost:9000'
 }));
 
 app.use(cookieParser());
